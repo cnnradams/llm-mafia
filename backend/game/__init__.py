@@ -1,0 +1,2 @@
+"""Mafia game engine."""
+
