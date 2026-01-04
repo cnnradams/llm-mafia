@@ -43,10 +43,16 @@ class Player:
     team: Team
     is_alive: bool = True
     is_human: bool = False
-    model_name: Optional[str] = None  # For LLM players
+    model_name: Optional[str] = None  # For LLM players (OpenRouter model ID)
+    model_label: Optional[str] = None  # Short label for CLI display (hidden from game)
+    model_provider: Optional[str] = None  # Provider name for CLI display
     
     def to_dict(self, hide_role: bool = False) -> Dict:
-        """Convert player to dictionary."""
+        """Convert player to dictionary.
+        
+        Note: model_label and model_provider are intentionally NOT included
+        in the dict output to keep them hidden from the game/prompts.
+        """
         data = {
             "player_id": self.player_id,
             "name": self.name,
@@ -56,8 +62,7 @@ class Player:
         if not hide_role or self.is_human:
             data["role"] = self.role.value
             data["team"] = self.team.value
-        if self.model_name:
-            data["model_name"] = self.model_name
+        # model_name is also excluded to prevent LLMs from knowing their identity
         return data
 
 

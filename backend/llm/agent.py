@@ -1,14 +1,15 @@
 """LLM agent player."""
 import random
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from game.state import GameState
 from game.actions import (
     Action, SpeakAction, NominateAction, VoteAction, PassAction, NightAction,
-    NightActionType, action_from_dict
+    NightActionType, JudgmentVoteAction, action_from_dict
 )
 from llm.openrouter_client import get_client
 from llm.prompts import build_prompt_for_player
+from llm.memory import PlayerMemory, MEMORY_UPDATE_PROMPT
 from config import DEFAULT_MODEL
 
 
@@ -19,6 +20,7 @@ class LLMAgent:
         self.player_id = player_id
         self.model_name = model_name
         self.persona = persona
+        self.memory = PlayerMemory(player_id=player_id)
     
     async def get_action(
         self,
@@ -34,6 +36,11 @@ class LLMAgent:
         # Add persona if provided
         if self.persona:
             prompt = f"## Your Persona\n{self.persona}\n\n{prompt}"
+        
+        # Add memory section at the end
+        memory_section = self.memory.to_prompt_section()
+        if memory_section:
+            prompt = f"{prompt}\n\n{memory_section}"
         
         messages = [
             {
@@ -66,6 +73,42 @@ class LLMAgent:
         except Exception as e:
             print(f"Error getting action from LLM: {e}, falling back to pass")
             return PassAction(player_id=self.player_id)
+    
+    async def update_memory(
+        self,
+        game_state: GameState,
+        phase_events: str,
+    ) -> None:
+        """Update the agent's memory after a phase completes."""
+        client = get_client()
+        
+        player = game_state.players[self.player_id]
+        current_memory = self.memory.memory_text or "No previous memory."
+        
+        # Include player identity context in memory update
+        identity_context = f"You are {player.name} ({self.player_id}), Role: {player.role.value}, Team: {player.team.value}"
+        
+        prompt = MEMORY_UPDATE_PROMPT.format(
+            identity=identity_context,
+            phase_events=phase_events,
+            current_memory=current_memory,
+        )
+        
+        messages = [{"role": "user", "content": prompt}]
+        
+        try:
+            response_data = await client.get_json_response(
+                self.model_name,
+                messages,
+                temperature=0.5,  # Lower temperature for memory updates
+            )
+            
+            # Update memory from response
+            if "memory" in response_data:
+                self.memory.update_memory(response_data["memory"])
+        
+        except Exception as e:
+            print(f"Error updating memory for {self.player_id}: {e}")
     
     async def get_random_action(self, game_state: GameState) -> Action:
         """Get a random valid action (fallback)."""

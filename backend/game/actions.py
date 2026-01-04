@@ -12,6 +12,7 @@ class ActionType(Enum):
     SPEAK = "SPEAK"
     NOMINATE = "NOMINATE"
     VOTE = "VOTE"
+    JUDGMENT_VOTE = "JUDGMENT_VOTE"  # GUILTY/INNOCENT vote
     PASS = "PASS"
     NIGHT_ACTION = "NIGHT_ACTION"
 
@@ -59,8 +60,8 @@ class SpeakAction(Action):
     
     def validate(self, game_state: GameState) -> tuple[bool, Optional[str]]:
         """Validate speak action."""
-        if game_state.current_phase != Phase.DAY_DISCUSSION:
-            return False, "Can only speak during discussion phase"
+        if game_state.current_phase not in [Phase.DAY_DISCUSSION, Phase.DAY_DEFENSE]:
+            return False, "Can only speak during discussion or defense phase"
         
         player = game_state.players.get(self.player_id)
         if not player:
@@ -69,9 +70,12 @@ class SpeakAction(Action):
         if not player.is_alive:
             return False, "Dead players cannot speak"
         
-        current_speaker = game_state.get_current_speaker()
-        if not current_speaker or current_speaker.player_id != self.player_id:
-            return False, "Not your turn to speak"
+        # In defense phase, speaking order is managed by the CLI (defendant, then others, then defendant)
+        # In discussion phase, only current speaker can speak
+        if game_state.current_phase == Phase.DAY_DISCUSSION:
+            current_speaker = game_state.get_current_speaker()
+            if not current_speaker or current_speaker.player_id != self.player_id:
+                return False, "Not your turn to speak"
         
         if not self.message or not self.message.strip():
             return False, "Message cannot be empty"
@@ -89,8 +93,8 @@ class NominateAction(Action):
     
     def validate(self, game_state: GameState) -> tuple[bool, Optional[str]]:
         """Validate nominate action."""
-        if game_state.current_phase != Phase.DAY_DISCUSSION:
-            return False, "Can only nominate during discussion phase"
+        if game_state.current_phase not in [Phase.DAY_DISCUSSION, Phase.DAY_NOMINATION]:
+            return False, "Can only nominate during discussion or nomination phase"
         
         player = game_state.players.get(self.player_id)
         if not player:
@@ -99,9 +103,12 @@ class NominateAction(Action):
         if not player.is_alive:
             return False, "Dead players cannot nominate"
         
-        current_speaker = game_state.get_current_speaker()
-        if not current_speaker or current_speaker.player_id != self.player_id:
-            return False, "Not your turn to nominate"
+        # In nomination phase, everyone nominates (no speaker order)
+        # In discussion phase, only current speaker can nominate
+        if game_state.current_phase == Phase.DAY_DISCUSSION:
+            current_speaker = game_state.get_current_speaker()
+            if not current_speaker or current_speaker.player_id != self.player_id:
+                return False, "Not your turn to nominate"
         
         target = game_state.players.get(self.target_id)
         if not target:
@@ -160,8 +167,8 @@ class PassAction(Action):
     
     def validate(self, game_state: GameState) -> tuple[bool, Optional[str]]:
         """Validate pass action."""
-        if game_state.current_phase != Phase.DAY_DISCUSSION:
-            return False, "Can only pass during discussion phase"
+        if game_state.current_phase not in [Phase.DAY_DISCUSSION, Phase.DAY_NOMINATION, Phase.DAY_JUDGMENT]:
+            return False, "Can only pass during discussion, nomination, or judgment phase"
         
         player = game_state.players.get(self.player_id)
         if not player:
@@ -170,11 +177,62 @@ class PassAction(Action):
         if not player.is_alive:
             return False, "Dead players cannot pass"
         
-        current_speaker = game_state.get_current_speaker()
-        if not current_speaker or current_speaker.player_id != self.player_id:
-            return False, "Not your turn to pass"
+        # In nomination phase, everyone acts (no speaker order)
+        # In discussion phase, only current speaker can pass
+        if game_state.current_phase == Phase.DAY_DISCUSSION:
+            current_speaker = game_state.get_current_speaker()
+            if not current_speaker or current_speaker.player_id != self.player_id:
+                return False, "Not your turn to pass"
         
         return True, None
+
+
+@dataclass
+class JudgmentVoteAction(Action):
+    """Player votes GUILTY or INNOCENT during judgment phase."""
+    vote: str  # "GUILTY" or "INNOCENT"
+    reason: str = ""  # Optional reasoning
+    
+    def __post_init__(self):
+        self.action_type = ActionType.JUDGMENT_VOTE
+    
+    def validate(self, game_state: GameState) -> tuple[bool, Optional[str]]:
+        """Validate judgment vote action."""
+        if game_state.current_phase != Phase.DAY_JUDGMENT:
+            return False, "Can only vote during judgment phase"
+        
+        player = game_state.players.get(self.player_id)
+        if not player:
+            return False, "Player not found"
+        
+        if not player.is_alive:
+            return False, "Dead players cannot vote"
+        
+        if not game_state.trial_state:
+            return False, "No trial in progress"
+        
+        # Defendant cannot vote
+        if self.player_id == game_state.trial_state.defendant_id:
+            return False, "Defendant cannot vote"
+        
+        # Already voted
+        if self.player_id in game_state.trial_state.votes:
+            return False, "Already voted"
+        
+        # Validate vote value
+        if self.vote.upper() not in ["GUILTY", "INNOCENT"]:
+            return False, "Vote must be GUILTY or INNOCENT"
+        
+        return True, None
+    
+    def to_dict(self) -> dict:
+        """Convert action to dictionary."""
+        return {
+            "player_id": self.player_id,
+            "action_type": self.action_type.value,
+            "vote": self.vote,
+            "reason": self.reason,
+        }
 
 
 @dataclass
@@ -236,6 +294,12 @@ def action_from_dict(data: dict) -> Action:
         return NominateAction(player_id=player_id, target_id=data["target_id"])
     elif action_type == ActionType.VOTE:
         return VoteAction(player_id=player_id, nominee_id=data["nominee_id"])
+    elif action_type == ActionType.JUDGMENT_VOTE:
+        return JudgmentVoteAction(
+            player_id=player_id,
+            vote=data["vote"],
+            reason=data.get("reason", "")
+        )
     elif action_type == ActionType.PASS:
         return PassAction(player_id=player_id)
     elif action_type == ActionType.NIGHT_ACTION:

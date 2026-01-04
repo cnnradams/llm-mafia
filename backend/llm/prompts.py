@@ -1,8 +1,9 @@
 """Prompt generation for LLM players - Town of Salem style."""
 from typing import List, Optional, Dict, Any
+from collections import Counter
 
 from game.state import GameState, Player, Phase, Role
-from game.events import EventLog, EventType
+from game.events import EventLog, EventType, GameEvent
 
 
 GAME_RULES = """
@@ -46,6 +47,9 @@ def build_prompt_for_player(
     prompt_parts.append("# Mafia Game - You are playing as an AI agent")
     prompt_parts.append(GAME_RULES)
     
+    # Initial game setup
+    prompt_parts.append(build_game_setup(game_state))
+    
     # Current game state
     prompt_parts.append(f"\n## Current State")
     prompt_parts.append(f"- Phase: {game_state.current_phase.value}")
@@ -64,16 +68,10 @@ def build_prompt_for_player(
     # Player list with IDs
     prompt_parts.append(build_player_list(game_state))
     
-    # Day summary (if available)
-    if day_summary:
-        prompt_parts.append(f"\n## Summary of Previous Day")
-        prompt_parts.append(day_summary)
-    
-    # Event log
-    events_summary = build_events_summary(game_state, game_state.day)
-    if events_summary:
-        prompt_parts.append(f"\n## Recent Events")
-        prompt_parts.append(events_summary)
+    # Complete game history
+    history = build_complete_history(game_state)
+    if history:
+        prompt_parts.append(history)
     
     # Current phase context and action format
     phase = game_state.current_phase
@@ -92,6 +90,122 @@ def build_prompt_for_player(
     return "\n".join(prompt_parts)
 
 
+def build_game_setup(game_state: GameState) -> str:
+    """Build initial game setup information."""
+    # Count roles at game start (includes dead players)
+    role_counts = Counter(p.role for p in game_state.players.values())
+    
+    parts = ["\n## Initial Game Setup"]
+    parts.append(f"- Total Players: {len(game_state.players)}")
+    
+    if role_counts[Role.MAFIA] > 0:
+        parts.append(f"- Mafia: {role_counts[Role.MAFIA]}")
+    if role_counts[Role.VILLAGER] > 0:
+        parts.append(f"- Villagers: {role_counts[Role.VILLAGER]}")
+    if role_counts[Role.DETECTIVE] > 0:
+        parts.append(f"- Detective: {role_counts[Role.DETECTIVE]}")
+    if role_counts[Role.DOCTOR] > 0:
+        parts.append(f"- Doctor: {role_counts[Role.DOCTOR]}")
+    
+    return "\n".join(parts)
+
+
+def build_complete_history(game_state: GameState) -> str:
+    """Build a complete history of all game events organized by day/phase."""
+    parts = ["\n## Complete Game History"]
+    
+    if not game_state.event_log.events:
+        parts.append("\n(No events yet - game just started)")
+        return "\n".join(parts)
+    
+    # Organize events by day
+    events_by_day: Dict[int, List[GameEvent]] = {}
+    for event in game_state.event_log.events:
+        if event.day not in events_by_day:
+            events_by_day[event.day] = []
+        events_by_day[event.day].append(event)
+    
+    # Build history for each day
+    for day in sorted(events_by_day.keys()):
+        day_events = events_by_day[day]
+        
+        # Night events
+        night_events = [e for e in day_events if e.phase == "NIGHT"]
+        if night_events:
+            parts.append(f"\n### Night {day}")
+            
+            # Kills
+            kills = [e for e in night_events if e.type == EventType.KILL]
+            for kill in kills:
+                victim = game_state.players.get(kill.target_id)
+                if victim:
+                    role = kill.data.get("role", "UNKNOWN")
+                    parts.append(f"- **{victim.name}** was killed (was {role})")
+            
+            if not kills:
+                parts.append("- No one died this night")
+        
+        # Day events - only show completed days (where nominations or judgment occurred)
+        nomination_events = [e for e in day_events if e.phase == "DAY_NOMINATION"]
+        judgment_events = [e for e in day_events if e.phase in ["DAY_JUDGMENT", "DAY_DEFENSE"]]
+        
+        nominations = [e for e in nomination_events if e.type == EventType.NOMINATE]
+        eliminations = [e for e in judgment_events if e.type == EventType.ELIMINATE]
+        
+        # Only show Day section if nominations have occurred (not just discussion)
+        if nominations:
+            parts.append(f"\n### Day {day}")
+            
+            # Nominations - always show who was nominated
+            # Group by target
+            nom_by_target: Dict[str, List[str]] = {}
+            for nom in nominations:
+                target_id = nom.target_id
+                if target_id not in nom_by_target:
+                    nom_by_target[target_id] = []
+                nominator = game_state.players.get(nom.player_id)
+                if nominator:
+                    nom_by_target[target_id].append(nominator.name)
+            
+            parts.append("\n**Nominations:**")
+            for target_id, nominators in sorted(nom_by_target.items(), key=lambda x: -len(x[1])):
+                target = game_state.players.get(target_id)
+                if target:
+                    nom_str = ", ".join(nominators)
+                    parts.append(f"- {target.name}: {len(nominators)} votes ({nom_str})")
+            
+            # Show who went to trial (most nominated)
+            if nom_by_target:
+                most_nominated = max(nom_by_target.items(), key=lambda x: len(x[1]))
+                defendant = game_state.players.get(most_nominated[0])
+                if defendant:
+                    parts.append(f"\n**→ {defendant.name} went to trial**")
+            
+            # Trial/Judgment
+            if eliminations:
+                for elim in eliminations:
+                    defendant = game_state.players.get(elim.player_id)
+                    if defendant:
+                        role = elim.data.get("role", "UNKNOWN")
+                        parts.append(f"\n**Trial Result:** {defendant.name} was **EXECUTED** (was {role})")
+                        
+                        # Show votes if available in data
+                        if "votes" in elim.data:
+                            votes = elim.data["votes"]
+                            guilty_voters = [game_state.players[pid].name for pid, vote in votes.items() if vote and pid in game_state.players]
+                            innocent_voters = [game_state.players[pid].name for pid, vote in votes.items() if not vote and pid in game_state.players]
+                            
+                            if guilty_voters:
+                                parts.append(f"  - Guilty ({len(guilty_voters)}): {', '.join(guilty_voters)}")
+                            if innocent_voters:
+                                parts.append(f"  - Innocent ({len(innocent_voters)}): {', '.join(innocent_voters)}")
+            elif judgment_events:
+                # Trial happened but no one was eliminated = acquittal
+                parts.append(f"**Trial Result:** {defendant.name} was **ACQUITTED**")
+    
+    return "\n".join(parts)
+
+
 def build_role_knowledge(game_state: GameState, player: Player) -> str:
     """Build role-specific knowledge section."""
     parts = []
@@ -101,6 +215,28 @@ def build_role_knowledge(game_state: GameState, player: Player) -> str:
         mafia_info = [f"{p.name} (`{p.player_id}`)" for p in mafia_players]
         parts.append(f"\n**Mafia teammates**: {', '.join(mafia_info)}")
         parts.append("Your goal: Eliminate Town without getting caught.")
+        
+        # Show Mafia kill attempts and results
+        night_actions = game_state.event_log.get_events_by_type(EventType.NIGHT_ACTION)
+        kills = game_state.event_log.get_events_by_type(EventType.KILL)
+        
+        mafia_kills = {}
+        for event in night_actions:
+            if event.data.get("action_type") == "KILL":
+                # This was a kill attempt
+                mafia_kills[event.day] = event.target_id
+        
+        if mafia_kills:
+            parts.append("\n**Your kill attempts:**")
+            for day, target_id in sorted(mafia_kills.items()):
+                target = game_state.players.get(target_id)
+                if target:
+                    # Check if kill was successful
+                    kill_succeeded = any(k.day == day and k.target_id == target_id for k in kills)
+                    if kill_succeeded:
+                        parts.append(f"- Night {day}: Killed {target.name} ✓")
+                    else:
+                        parts.append(f"- Night {day}: Tried to kill {target.name} - **BLOCKED** (Doctor saved them)")
     
     elif player.role == Role.DETECTIVE:
         parts.append("\n**Your ability**: Investigate one player each night.")
@@ -141,27 +277,6 @@ def build_player_list(game_state: GameState) -> str:
     return "\n".join(parts)
 
 
-def build_events_summary(game_state: GameState, current_day: int) -> str:
-    """Build a summary of important events."""
-    events = []
-    
-    # Deaths
-    kills = game_state.event_log.get_events_by_type(EventType.KILL)
-    for kill in kills:
-        target = game_state.players.get(kill.target_id)
-        if target:
-            role = kill.data.get("role", "UNKNOWN")
-            events.append(f"Night {kill.day}: {target.name} killed (was {role})")
-    
-    # Eliminations
-    eliminations = game_state.event_log.get_events_by_type(EventType.ELIMINATE)
-    for elim in eliminations:
-        eliminated = game_state.players.get(elim.player_id)
-        if eliminated:
-            role = elim.data.get("role", "UNKNOWN")
-            events.append(f"Day {elim.day}: {eliminated.name} executed (was {role})")
-    
-    return "\n".join(events) if events else ""
 
 
 def build_night_prompt(game_state: GameState, player: Player) -> str:
@@ -215,12 +330,13 @@ def build_discussion_prompt(game_state: GameState, player: Player) -> str:
     parts.append("\nThis is the discussion phase. Share your observations, suspicions, or defend yourself.")
     parts.append("Keep your message focused and strategic.")
     
-    # Show recent speeches
+    # Show recent speeches from THIS discussion phase only
     speeches = game_state.event_log.get_speeches()
-    current_day_speeches = [s for s in speeches if s.day == game_state.day]
-    if current_day_speeches:
+    discussion_speeches = [s for s in speeches 
+                          if s.day == game_state.day and s.phase == "DAY_DISCUSSION"]
+    if discussion_speeches:
         parts.append("\n**Recent discussion:**")
-        for speech in current_day_speeches[-5:]:
+        for speech in discussion_speeches[-5:]:
             speaker = game_state.players.get(speech.player_id)
             if speaker:
                 msg = speech.data.get('message', '')
@@ -277,16 +393,43 @@ def build_defense_prompt(game_state: GameState, player: Player) -> str:
     
     is_defendant = player.player_id == defendant.player_id
     
+    # Show trial speeches so far - FULL speeches
+    trial_speeches = [s for s in game_state.event_log.get_speeches() 
+                      if s.day == game_state.day and s.phase == "DAY_DEFENSE"]
+    if trial_speeches:
+        parts.append("\n**Trial statements so far:**")
+        for speech in trial_speeches:
+            speaker = game_state.players.get(speech.player_id)
+            if speaker:
+                context = speech.data.get('context', '')
+                msg = speech.data.get('message', '')
+                if context == "opening_defense":
+                    parts.append(f"\n- **{speaker.name} (opening):** \"{msg}\"")
+                elif context == "town_response":
+                    parts.append(f"\n- **{speaker.name}:** \"{msg}\"")
+    
     if is_defendant:
-        parts.append(f"\n**YOU ARE ON TRIAL!** Defend yourself!")
-        parts.append("Explain why you are not Mafia. Be convincing!")
+        parts.append(f"\n**⚠️ YOU ({player.name}) ARE ON TRIAL! THE TOWN WANTS TO EXECUTE YOU!**")
+        parts.append("\n**This is YOUR DEFENSE - defend YOURSELF!**")
+        parts.append("Speak in FIRST PERSON ('I am innocent...', 'I didn't...', 'My role is...').")
+        parts.append("DO NOT talk about yourself in third person. YOU are defending YOUR life!")
+        parts.append("\nDefense strategies:")
+        parts.append("- Claim your role (if safe to do so)")
+        parts.append("- Explain why you're innocent")
+        parts.append("- Point out why the accusations against you are wrong")
+        parts.append("- Redirect suspicion to actual suspicious players")
+        parts.append("- Appeal to your voting/speaking record")
     else:
         parts.append(f"\n**{defendant.name} is on trial.**")
-        parts.append("Share your opinion - are they guilty or innocent?")
+        parts.append("Share your opinion - do you think they are Mafia or Town?")
+        parts.append("Consider their behavior, claims, and who nominated them.")
     
-    parts.append("\n**Respond with JSON:**")
+    parts.append("\n**Respond with JSON (defend yourself in first person):**")
     parts.append('```json')
-    parts.append('{"action_type": "SPEAK", "message": "Your statement..."}')
+    if is_defendant:
+        parts.append('{"action_type": "SPEAK", "message": "I am innocent! I am a [role] and here is why you should not execute me: [your defense]"}')
+    else:
+        parts.append('{"action_type": "SPEAK", "message": "I think [defendant] is suspicious because... OR I think [defendant] is innocent because..."}')
     parts.append('```')
     
     return "\n".join(parts)
@@ -311,6 +454,23 @@ def build_judgment_prompt(game_state: GameState, player: Player) -> str:
         parts.append('```')
         return "\n".join(parts)
     
+    # Show trial speeches for context - FULL speeches, not summarized
+    trial_speeches = [s for s in game_state.event_log.get_speeches() 
+                      if s.day == game_state.day and s.phase == "DAY_DEFENSE"]
+    if trial_speeches:
+        parts.append("\n**Trial defense (full statements):**")
+        for speech in trial_speeches:
+            speaker = game_state.players.get(speech.player_id)
+            if speaker:
+                context = speech.data.get('context', '')
+                msg = speech.data.get('message', '')
+                if context == "opening_defense":
+                    parts.append(f"\n- **{speaker.name} (defendant opening):** \"{msg}\"")
+                elif context == "closing_defense":
+                    parts.append(f"\n- **{speaker.name} (defendant closing):** \"{msg}\"")
+                else:
+                    parts.append(f"\n- **{speaker.name}:** \"{msg}\"")
+    
     parts.append(f"\n**Should {defendant.name} be executed?**")
     parts.append("- Vote GUILTY if you believe they are Mafia")
     parts.append("- Vote INNOCENT if you believe they are Town")
@@ -321,13 +481,13 @@ def build_judgment_prompt(game_state: GameState, player: Player) -> str:
         innocent = sum(1 for v in game_state.trial_state.votes.values() if not v)
         parts.append(f"\n**Current votes:** {guilty} Guilty, {innocent} Innocent")
     
-    parts.append("\n**Respond with JSON (include your reasoning in message):**")
+    parts.append("\n**Respond with JSON:**")
     parts.append('```json')
-    parts.append('{"action_type": "SPEAK", "message": "GUILTY - I believe they are Mafia because..."}')
+    parts.append('{"action_type": "JUDGMENT_VOTE", "vote": "GUILTY", "reason": "I believe they are Mafia because..."}')
     parts.append('```')
     parts.append("OR")
     parts.append('```json')
-    parts.append('{"action_type": "SPEAK", "message": "INNOCENT - I believe they are Town because..."}')
+    parts.append('{"action_type": "JUDGMENT_VOTE", "vote": "INNOCENT", "reason": "I believe they are Town because..."}')
     parts.append('```')
     
     return "\n".join(parts)

@@ -19,14 +19,14 @@ from rich.markdown import Markdown
 
 from game.state import GameState, Player, Role, Team, Phase, TrialState
 from game.actions import (
-    SpeakAction, NominateAction, VoteAction, PassAction, NightAction, NightActionType,
+    Action, SpeakAction, NominateAction, VoteAction, PassAction, NightAction, NightActionType,
 )
 from game.phases import process_action, process_night_results
 from game.events import EventType
 from llm.agent import LLMAgent
 from llm.prompts import build_prompt_for_player
 from llm.openrouter_client import get_client
-from config import DEFAULT_MODEL
+from config import DEFAULT_MODEL, get_random_models
 
 console = Console()
 
@@ -45,6 +45,114 @@ class MafiaCLI:
         self.model: str = DEFAULT_MODEL
         # Limit discussion rounds per player (None = unlimited)
         self.max_rounds_per_player: int = 2  # Each player speaks max 2 times before forcing nominations
+        # Enable/disable memory updates (can be slow with many players)
+        self.enable_memory: bool = True
+        # Use diverse models (True) or single model (False)
+        self.use_diverse_models: bool = True
+        # Debug mode - print prompts sent to LLMs
+        self.debug_mode: bool = False
+    
+    async def _update_all_memories(self, phase_events: str) -> None:
+        """Update memory for all alive agents after a phase."""
+        if not self.enable_memory or not self.game:
+            return
+        
+        console.print("[dim]Updating agent memories...[/dim]")
+        
+        for player in self.game.get_alive_players():
+            agent = self.agents.get(player.player_id)
+            if agent:
+                try:
+                    await agent.update_memory(self.game, phase_events)
+                except Exception as e:
+                    console.print(f"[dim]Memory update failed for {player.name}: {e}[/dim]")
+    
+    async def _get_agent_action_with_debug(
+        self,
+        player_id: str,
+        context: str = ""
+    ) -> Action:
+        """Get action from agent, printing prompt in debug mode."""
+        if not self.game:
+            return PassAction(player_id=player_id)
+        
+        agent = self.agents.get(player_id)
+        if not agent:
+            return PassAction(player_id=player_id)
+        
+        # Build prompt for debug display
+        if self.debug_mode:
+            player = self.game.players.get(player_id)
+            if player:
+                day_summary = self.game.day_summaries.get(self.game.day - 1)
+                prompt = build_prompt_for_player(self.game, player_id, day_summary)
+                
+                # Add memory section
+                memory_section = agent.memory.to_prompt_section()
+                if memory_section:
+                    prompt = f"{prompt}\n\n{memory_section}"
+                
+                model_label = player.model_label or "?"
+                title = f"🐛 DEBUG: {player.name} ({model_label})"
+                if context:
+                    title += f" - {context}"
+                
+                console.print("\n" + "="*80)
+                console.print(Panel(
+                    Markdown(prompt),
+                    title=title,
+                    border_style="yellow",
+                    expand=False
+                ))
+                console.print("="*80 + "\n")
+        
+        # Get action from agent
+        day_summary = self.game.day_summaries.get(self.game.day - 1)
+        action = await agent.get_action(self.game, day_summary)
+        
+        return action
+    
+    def _get_phase_events_summary(self) -> str:
+        """Get a summary of events from the current phase."""
+        if not self.game:
+            return ""
+        
+        events = self.game.event_log.get_events_by_day(self.game.day)
+        current_phase = self.game.current_phase.value
+        
+        lines = []
+        for event in events:
+            if event.phase == current_phase:
+                if event.type == EventType.SPEAK:
+                    speaker = self.game.players.get(event.player_id)
+                    msg = event.data.get('message', '')[:150]
+                    if speaker:
+                        lines.append(f"{speaker.name}: \"{msg}\"")
+                elif event.type == EventType.NOMINATE:
+                    nominator = self.game.players.get(event.player_id)
+                    target = self.game.players.get(event.target_id)
+                    if nominator and target:
+                        lines.append(f"{nominator.name} nominated {target.name}")
+                elif event.type == EventType.ELIMINATE:
+                    eliminated = self.game.players.get(event.player_id)
+                    role = event.data.get('role', 'UNKNOWN')
+                    if eliminated:
+                        lines.append(f"{eliminated.name} was executed (was {role})")
+                elif event.type == EventType.KILL:
+                    killed = self.game.players.get(event.target_id)
+                    role = event.data.get('role', 'UNKNOWN')
+                    if killed:
+                        lines.append(f"{killed.name} was killed at night (was {role})")
+        
+        # Add nomination counts if in nomination phase
+        if self.game.current_phase == Phase.DAY_NOMINATION and self.game.nominations:
+            lines.append("\nNomination results:")
+            for target_id, nominators in sorted(self.game.nominations.items(), key=lambda x: -len(x[1])):
+                target = self.game.players.get(target_id)
+                if target:
+                    lines.append(f"  {target.name}: {len(nominators)} votes")
+        
+        return "\n".join(lines)
     
     def create_game(
         self,
@@ -70,11 +178,21 @@ class MafiaCLI:
         
         random.shuffle(roles)
         
+        # Get models for each player
+        if self.use_diverse_models:
+            models = get_random_models(num_players)
+        else:
+            # Use the same model for all players
+            models = [(self.model, "Default", "Single")] * num_players
+        
         # Create players
         player_names = random.sample(NAMES, num_players)
         for i, (name, role) in enumerate(zip(player_names, roles)):
             player_id = f"p{i}"
             team = Team.MAFIA_TEAM if role == Role.MAFIA else Team.TOWN_TEAM
+            
+            # Get model info for this player
+            model_id, model_label, model_provider = models[i % len(models)]
             
             player = Player(
                 player_id=player_id,
@@ -82,14 +200,16 @@ class MafiaCLI:
                 role=role,
                 team=team,
                 is_human=False,
-                model_name=self.model,
+                model_name=model_id,
+                model_label=model_label,
+                model_provider=model_provider,
             )
             self.game.add_player(player)
             
             # Create LLM agent for each player
             self.agents[player_id] = LLMAgent(
                 player_id=player_id,
-                model_name=self.model,
+                model_name=model_id,
             )
         
         self.game.is_started = True
@@ -107,14 +227,19 @@ class MafiaCLI:
         console.print()
         
         # Game info panel
+        model_mode = "Diverse" if self.use_diverse_models else f"Single ({self.model})"
         info_lines = [
             f"[bold]Game ID:[/bold] {self.game.game_id}",
             f"[bold]Phase:[/bold] {self.game.current_phase.value}",
             f"[bold]Day:[/bold] {self.game.day}",
-            f"[bold]Model:[/bold] {self.model}",
+            f"[bold]Models:[/bold] {model_mode}",
         ]
         if self.game.winner:
             info_lines.append(f"[bold green]Winner:[/bold green] {self.game.winner.value}")
+        
+        # Model legend
+        info_lines.append("")
+        info_lines.append("[dim]Model colors:[/dim] [yellow]●[/yellow] Anthropic  [bright_green]●[/bright_green] OpenAI  [bright_blue]●[/bright_blue] Google  [magenta]●[/magenta] Open Source")
         
         console.print(Panel("\n".join(info_lines), title="Game State", border_style="blue"))
         
@@ -122,10 +247,11 @@ class MafiaCLI:
         table = Table(title="Players", show_header=True, header_style="bold magenta")
         table.add_column("ID", style="dim", width=4)
         table.add_column("Name", width=10)
+        table.add_column("Model", width=10)  # Hidden from LLMs, only visible in CLI
         table.add_column("Role" if show_roles else "Role", width=12)
         table.add_column("Team" if show_roles else "Team", width=12)
         table.add_column("Status", width=10)
-        table.add_column("Speaker", width=8)
+        table.add_column("🎤", width=3)
         
         current_speaker = self.game.get_current_speaker()
         for player in self.game.players.values():
@@ -134,6 +260,20 @@ class MafiaCLI:
             
             role_display = player.role.value if show_roles else "???"
             team_display = player.team.value if show_roles else "???"
+            
+            # Model display with provider color coding
+            model_label = player.model_label or "?"
+            model_provider = player.model_provider or ""
+            if model_provider == "Anthropic":
+                model_display = f"[yellow]{model_label}[/yellow]"
+            elif model_provider == "OpenAI":
+                model_display = f"[bright_green]{model_label}[/bright_green]"
+            elif model_provider == "Google":
+                model_display = f"[bright_blue]{model_label}[/bright_blue]"
+            elif model_provider in ["Meta", "Qwen", "DeepSeek", "Mistral"]:
+                model_display = f"[magenta]{model_label}[/magenta]"
+            else:
+                model_display = f"[dim]{model_label}[/dim]"
             
             # Color by role
             if show_roles:
@@ -148,6 +288,7 @@ class MafiaCLI:
             table.add_row(
                 player.player_id,
                 player.name,
+                model_display,
                 role_display,
                 team_display,
                 status,
@@ -242,6 +383,13 @@ class MafiaCLI:
         day_summary = self.game.day_summaries.get(self.game.day - 1)
         prompt_text = build_prompt_for_player(self.game, player_id, day_summary)
         
+        # Include agent's memory at the end
+        agent = self.agents.get(player_id)
+        if agent and agent.memory:
+            memory_section = agent.memory.to_prompt_section()
+            if memory_section:
+                prompt_text = f"{prompt_text}\n\n{memory_section}"
+        
         console.print(Panel(
             Markdown(prompt_text),
             title=f"Prompt for {player.name} ({player_id})",
@@ -334,8 +482,10 @@ class MafiaCLI:
                     continue
                 
                 # Get speech from LLM
-                day_summary = self.game.day_summaries.get(self.game.day - 1)
-                action = await agent.get_action(self.game, day_summary)
+                action = await self._get_agent_action_with_debug(
+                    player.player_id,
+                    f"Discussion Round {round_num + 1}"
+                )
                 
                 # Force speak action (no nominations during discussion)
                 if isinstance(action, SpeakAction):
@@ -354,6 +504,10 @@ class MafiaCLI:
                 self.game.advance_speaker()
             
             console.print()
+        
+        # Update memories before moving to next phase
+        phase_events = self._get_phase_events_summary()
+        await self._update_all_memories(phase_events)
         
         # Move to nomination phase
         console.print("[yellow]Discussion complete. Moving to nominations...[/yellow]")
@@ -378,8 +532,10 @@ class MafiaCLI:
                 continue
             
             # Get nomination from LLM
-            day_summary = self.game.day_summaries.get(self.game.day - 1)
-            action = await agent.get_action(self.game, day_summary)
+            action = await self._get_agent_action_with_debug(
+                player.player_id,
+                "Nomination Phase"
+            )
             
             # Extract target
             target_id = None
@@ -399,6 +555,15 @@ class MafiaCLI:
             if target_id not in self.game.nominations:
                 self.game.nominations[target_id] = []
             self.game.nominations[target_id].append(player.player_id)
+            
+            # Log nomination event
+            self.game.event_log.add_event(
+                EventType.NOMINATE,
+                self.game.current_phase.value,
+                self.game.day,
+                player_id=player.player_id,
+                target_id=target_id
+            )
             
             target = self.game.players[target_id]
             console.print(f"{player.name} nominates {target.name}")
@@ -442,10 +607,20 @@ class MafiaCLI:
         console.print("[bold]--- Opening Defense ---[/bold]")
         agent = self.agents.get(defendant.player_id)
         if agent:
-            day_summary = self.game.day_summaries.get(self.game.day - 1)
-            action = await agent.get_action(self.game, day_summary)
+            action = await self._get_agent_action_with_debug(
+                defendant.player_id,
+                "Opening Defense"
+            )
             if isinstance(action, SpeakAction):
                 console.print(f"[bold]{defendant.name} (defendant):[/bold] \"{action.message}\"")
+                # Log defense speech
+                self.game.event_log.add_event(
+                    EventType.SPEAK,
+                    self.game.current_phase.value,
+                    self.game.day,
+                    player_id=defendant.player_id,
+                    data={"message": action.message, "context": "opening_defense"}
+                )
             else:
                 console.print(f"[bold]{defendant.name} (defendant):[/bold] [dim](remains silent)[/dim]")
         
@@ -459,22 +634,47 @@ class MafiaCLI:
             if not agent:
                 continue
             
-            day_summary = self.game.day_summaries.get(self.game.day - 1)
-            action = await agent.get_action(self.game, day_summary)
+            action = await self._get_agent_action_with_debug(
+                player.player_id,
+                "Town Response"
+            )
             
             if isinstance(action, SpeakAction):
                 console.print(f"[bold]{player.name}:[/bold] \"{action.message}\"")
+                # Log town response speech
+                self.game.event_log.add_event(
+                    EventType.SPEAK,
+                    self.game.current_phase.value,
+                    self.game.day,
+                    player_id=player.player_id,
+                    data={"message": action.message, "context": "town_response"}
+                )
             else:
                 console.print(f"[bold]{player.name}:[/bold] [dim](no comment)[/dim]")
         
         # 3. Defendant closing statement
         console.print("\n[bold]--- Closing Defense ---[/bold]")
         if agent:
-            action = await agent.get_action(self.game, day_summary)
+            action = await self._get_agent_action_with_debug(
+                defendant.player_id,
+                "Closing Defense"
+            )
             if isinstance(action, SpeakAction):
                 console.print(f"[bold]{defendant.name} (defendant):[/bold] \"{action.message}\"")
+                # Log closing defense speech
+                self.game.event_log.add_event(
+                    EventType.SPEAK,
+                    self.game.current_phase.value,
+                    self.game.day,
+                    player_id=defendant.player_id,
+                    data={"message": action.message, "context": "closing_defense"}
+                )
             else:
                 console.print(f"[bold]{defendant.name} (defendant):[/bold] [dim](remains silent)[/dim]")
+        
+        # Update memories with defense statements
+        phase_events = self._get_phase_events_summary()
+        await self._update_all_memories(phase_events)
         
         # Move to judgment
         console.print("\n[yellow]Defense complete. Moving to judgment...[/yellow]")
@@ -504,34 +704,45 @@ class MafiaCLI:
             if not agent:
                 continue
             
-            # Get vote from LLM - we'll interpret any action as a vote
-            day_summary = self.game.day_summaries.get(self.game.day - 1)
-            action = await agent.get_action(self.game, day_summary)
+            # Get vote from LLM
+            action = await self._get_agent_action_with_debug(
+                player.player_id,
+                "Judgment Vote"
+            )
             
-            # Determine vote (simple heuristic: Mafia votes innocent for each other)
+            # Determine vote based on action type
             vote_guilty = True  # Default
+            reason = ""
             
-            # Check if action has vote info
-            if hasattr(action, 'message'):
+            # Check if it's a JudgmentVoteAction
+            if hasattr(action, 'vote'):
+                vote_str = action.vote.upper() if action.vote else ""
+                vote_guilty = vote_str == "GUILTY"
+                reason = getattr(action, 'reason', '')
+            # Fallback: check message for GUILTY/INNOCENT keywords
+            elif hasattr(action, 'message'):
                 msg = action.message.lower() if action.message else ""
                 if 'innocent' in msg or 'not guilty' in msg:
                     vote_guilty = False
                 elif 'guilty' in msg:
                     vote_guilty = True
                 else:
-                    # Random for now - TODO: better LLM integration
+                    # Random fallback
                     vote_guilty = random.choice([True, False])
             else:
+                # Random fallback
                 vote_guilty = random.choice([True, False])
             
             self.game.trial_state.votes[player.player_id] = vote_guilty
             
             if vote_guilty:
                 guilty_votes += 1
-                console.print(f"{player.name}: [red]GUILTY[/red]")
+                reason_text = f" - {reason}" if reason else ""
+                console.print(f"{player.name}: [red]GUILTY[/red]{reason_text}")
             else:
                 innocent_votes += 1
-                console.print(f"{player.name}: [green]INNOCENT[/green]")
+                reason_text = f" - {reason}" if reason else ""
+                console.print(f"{player.name}: [green]INNOCENT[/green]{reason_text}")
         
         # Determine verdict
         console.print(f"\n[bold]Votes: {guilty_votes} Guilty, {innocent_votes} Innocent[/bold]")
@@ -547,7 +758,11 @@ class MafiaCLI:
                 self.game.current_phase.value,
                 self.game.day,
                 player_id=defendant.player_id,
-                data={"role": defendant.role.value, "team": defendant.team.value}
+                data={
+                    "role": defendant.role.value,
+                    "team": defendant.team.value,
+                    "votes": dict(self.game.trial_state.votes)  # Include vote details
+                }
             )
             
             # Check win condition
@@ -559,6 +774,10 @@ class MafiaCLI:
         else:
             # INNOCENT or TIE - acquit
             console.print(f"\n[bold green]✓ {defendant.name} has been acquitted![/bold green]")
+        
+        # Update memories with judgment results
+        phase_events = self._get_phase_events_summary()
+        await self._update_all_memories(phase_events)
         
         # Move to night
         self._transition_to_night()
@@ -588,8 +807,10 @@ class MafiaCLI:
             if not agent:
                 continue
             
-            day_summary = self.game.day_summaries.get(self.game.day - 1)
-            action = await agent.get_action(self.game, day_summary)
+            action = await self._get_agent_action_with_debug(
+                player.player_id,
+                f"Night Action ({player.role.value})"
+            )
             
             # Get target from action
             target_id = None
@@ -661,6 +882,15 @@ class MafiaCLI:
                     console.print(f"[red]💀 {dead_player.name} was found dead! (was {dead_player.role.value})[/red]")
             else:
                 console.print(f"[green]Everyone survived the night![/green]")
+            
+            # Update memories with night results
+            night_summary = "Night phase completed. "
+            if died:
+                dead_names = [self.game.players[pid].name for pid in died]
+                night_summary += f"Killed: {', '.join(dead_names)}. "
+            else:
+                night_summary += "No one died. "
+            await self._update_all_memories(night_summary)
             
             # Check win condition
             winner = self.game.check_win_conditions()
@@ -835,13 +1065,39 @@ class MafiaCLI:
             
             elif command == "model":
                 if args:
-                    self.model = args[0]
-                    # Update all agents
-                    for agent in self.agents.values():
-                        agent.model_name = self.model
-                    console.print(f"[green]✓ Model set to {self.model}[/green]")
+                    if args[0].lower() == "diverse":
+                        self.use_diverse_models = True
+                        console.print(f"[green]✓ Using diverse models (multiple LLMs)[/green]")
+                    elif args[0].lower() == "single":
+                        self.use_diverse_models = False
+                        console.print(f"[green]✓ Using single model: {self.model}[/green]")
+                    else:
+                        self.model = args[0]
+                        self.use_diverse_models = False
+                        # Update all agents
+                        for agent in self.agents.values():
+                            agent.model_name = self.model
+                        console.print(f"[green]✓ Model set to {self.model} (single mode)[/green]")
                 else:
-                    console.print(f"Current model: {self.model}")
+                    if self.use_diverse_models:
+                        console.print(f"Mode: [bold]Diverse[/bold] (using multiple LLMs)")
+                    else:
+                        console.print(f"Mode: [bold]Single[/bold] ({self.model})")
+            
+            elif command == "models":
+                # Show all available models
+                from config import MODEL_POOL
+                console.print("[bold cyan]Available Models:[/bold cyan]")
+                for model_id, label, provider in MODEL_POOL:
+                    if provider == "Anthropic":
+                        color = "yellow"
+                    elif provider == "OpenAI":
+                        color = "bright_green"
+                    elif provider == "Google":
+                        color = "bright_blue"
+                    else:
+                        color = "magenta"
+                    console.print(f"  [{color}]{label:8}[/{color}] {provider:10} {model_id}")
             
             elif command == "chat":
                 if not args_str:
@@ -859,6 +1115,13 @@ class MafiaCLI:
                     console.print(f"[green]✓ Max discussion rounds set to {self.max_rounds_per_player}[/green]")
                 else:
                     console.print(f"Max discussion rounds per player: {self.max_rounds_per_player}")
+            
+            elif command == "debug":
+                self.debug_mode = not self.debug_mode
+                status = "enabled" if self.debug_mode else "disabled"
+                console.print(f"[green]✓ Debug mode {status}[/green]")
+                if self.debug_mode:
+                    console.print("[dim]Will print full prompts sent to LLMs[/dim]")
             
             elif command == "quickstart":
                 # Create game and run first night automatically, then show Day 1
@@ -912,8 +1175,12 @@ class MafiaCLI:
             "  [cyan]quickstart[/cyan] [p] [m]     - Create game & run first night\n"
             "  [cyan]state[/cyan] / [cyan]s[/cyan]              - Show game state\n"
             "  [cyan]events[/cyan] / [cyan]e[/cyan] [n]         - Show last n events\n"
-            "  [cyan]model[/cyan] [name]           - Get/set LLM model\n"
             "  [cyan]rounds[/cyan] [n]             - Discussion rounds per player (default: 2)\n"
+            "\n[bold cyan]Model Settings[/bold cyan]\n"
+            "  [cyan]model[/cyan] diverse          - Use multiple different LLMs (default)\n"
+            "  [cyan]model[/cyan] single           - Use single model for all players\n"
+            "  [cyan]model[/cyan] <name>           - Set specific model (switches to single)\n"
+            "  [cyan]models[/cyan]                 - List all available models\n"
             "\n[bold cyan]Running the Game[/bold cyan]\n"
             "  [cyan]phase[/cyan] / [cyan]run[/cyan]            - Run current phase to completion\n"
             "  [cyan]step[/cyan] / [cyan]n[/cyan] [count]       - Run n full phases\n"
@@ -923,11 +1190,13 @@ class MafiaCLI:
             "  [cyan]ask[/cyan] <id>               - Get action from LLM agent\n"
             "  [cyan]chat[/cyan] <message>         - Send raw message to LLM\n"
             "\n[bold cyan]Debug[/bold cyan]\n"
+            "  [cyan]debug[/cyan]                  - Toggle debug mode (shows LLM prompts)\n"
             "  [cyan]kill[/cyan] <id>              - Kill a player\n"
             "  [cyan]setphase[/cyan] <phase>       - Set phase (NIGHT/DAY_DISCUSSION/etc)\n"
             "\n[bold cyan]Other[/bold cyan]\n"
             "  [cyan]help[/cyan] / [cyan]?[/cyan]               - Show this help\n"
-            "  [cyan]quit[/cyan] / [cyan]q[/cyan]               - Exit",
+            "  [cyan]quit[/cyan] / [cyan]q[/cyan]               - Exit\n"
+            "\n[dim]Model legend: [yellow]●[/yellow] Anthropic [bright_green]●[/bright_green] OpenAI [bright_blue]●[/bright_blue] Google [magenta]●[/magenta] OSS[/dim]",
             title="Mafia CLI - Town of Salem Style",
             border_style="blue"
         ))
