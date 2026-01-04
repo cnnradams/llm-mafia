@@ -106,18 +106,21 @@ class LLMAgent:
         messages = [{"role": "user", "content": prompt}]
         
         try:
-            response_data = await client.get_json_response(
+            # Get plain text response (not JSON)
+            response = await client.chat_completion(
                 self.model_name,
                 messages,
                 temperature=0.5,  # Lower temperature for memory updates
             )
             
-            # Update memory from response
-            if "memory" in response_data:
-                new_memory = response_data["memory"]
-                # Sanitize: remove control characters that break JSON
-                new_memory = ''.join(char for char in new_memory if ord(char) >= 32 or char in '\n\t')
-                self.memory.update_memory(new_memory)
+            # Extract the text content
+            new_memory = response["choices"][0]["message"]["content"]
+            
+            # Sanitize: remove control characters
+            new_memory = ''.join(char for char in new_memory if ord(char) >= 32 or char in '\n\t')
+            
+            # Update memory
+            self.memory.update_memory(new_memory.strip())
         
         except Exception as e:
             print(f"Error updating memory for {self.player_id}: {e}")

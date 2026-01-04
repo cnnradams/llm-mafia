@@ -162,33 +162,18 @@ def build_complete_history(game_state: GameState) -> str:
             if not kills:
                 parts.append("- No one died this night")
         
-        # Day events - show discussion, nominations, trial, judgment
-        discussion_events = [e for e in day_events if e.phase == "DAY_DISCUSSION"]
+        # Day events - show OUTCOMES only (no discussion/defense text)
         nomination_events = [e for e in day_events if e.phase == "DAY_NOMINATION"]
-        defense_events = [e for e in day_events if e.phase == "DAY_DEFENSE"]
         judgment_events = [e for e in day_events if e.phase == "DAY_JUDGMENT"]
         
-        discussion_speeches = [e for e in discussion_events if e.type == EventType.SPEAK]
         nominations = [e for e in nomination_events if e.type == EventType.NOMINATE]
-        defense_speeches = [e for e in defense_events if e.type == EventType.SPEAK]
         eliminations = [e for e in judgment_events if e.type == EventType.ELIMINATE]
         
-        # Show Day section if there's discussion or nominations
-        if discussion_speeches or nominations:
+        # Show Day section if there were nominations
+        if nominations:
             parts.append(f"\n### Day {day}")
             
-            # Discussion phase - show all speeches
-            if discussion_speeches:
-                parts.append("\n**Discussion:**")
-                for i, speech in enumerate(discussion_speeches, 1):
-                    speaker = game_state.players.get(speech.player_id)
-                    if speaker:
-                        msg = speech.data.get('message', '')
-                        # Show full message for better context
-                        parts.append(f"{i}. **{speaker.name}**: \"{msg}\"")
-                        parts.append("")  # Blank line between speeches
-            
-            # Nominations - always show who was nominated
+            # Nominations - show who was nominated
             # Group by target
             nom_by_target: Dict[str, List[str]] = {}
             for nom in nominations:
@@ -213,28 +198,7 @@ def build_complete_history(game_state: GameState) -> str:
                 if defendant:
                     parts.append(f"\n**→ {defendant.name} went to trial**")
             
-            # Trial/Defense phase - show all defense speeches
-            if defense_speeches:
-                parts.append("\n**Trial Defense:**")
-                for speech in defense_speeches:
-                    speaker = game_state.players.get(speech.player_id)
-                    if speaker:
-                        context = speech.data.get('context', '')
-                        msg = speech.data.get('message', '')
-                        
-                        # Add context label
-                        if context == "opening_defense":
-                            label = f"**{speaker.name}** (DEFENDANT - opening)"
-                        elif context == "closing_defense":
-                            label = f"**{speaker.name}** (DEFENDANT - closing)"
-                        elif context == "town_response":
-                            label = f"**{speaker.name}**"
-                        else:
-                            label = f"**{speaker.name}**"
-                        
-                        parts.append(f"- {label}: \"{msg}\"")
-            
-            # Trial/Judgment
+            # Trial/Judgment outcome (no speeches, just results)
             if eliminations:
                 for elim in eliminations:
                     defendant = game_state.players.get(elim.player_id)
@@ -566,9 +530,14 @@ def build_judgment_prompt(game_state: GameState, player: Player) -> str:
     
     # Show current vote tally if any
     if game_state.trial_state.votes:
-        guilty = sum(1 for v in game_state.trial_state.votes.values() if v)
-        innocent = sum(1 for v in game_state.trial_state.votes.values() if not v)
-        parts.append(f"\n**Current votes:** {guilty} Guilty, {innocent} Innocent")
+        guilty_voters = [game_state.players[pid].name for pid, vote in game_state.trial_state.votes.items() if vote and pid in game_state.players]
+        innocent_voters = [game_state.players[pid].name for pid, vote in game_state.trial_state.votes.items() if not vote and pid in game_state.players]
+        
+        parts.append(f"\n**Current votes:**")
+        if guilty_voters:
+            parts.append(f"- Guilty ({len(guilty_voters)}): {', '.join(guilty_voters)}")
+        if innocent_voters:
+            parts.append(f"- Innocent ({len(innocent_voters)}): {', '.join(innocent_voters)}")
     
     parts.append("\n**Respond with JSON:**")
     parts.append('```json')

@@ -143,12 +143,7 @@ Include everything important: facts, suspicions, voting patterns, contradictions
 
 Write from YOUR perspective as {role}. Organize it however you think is best for your future reference.
 
-Respond with JSON:
-```json
-{{
-    "memory": "Your complete updated memory here..."
-}}
-```
+**Write your complete updated memory as plain text below (no JSON, no formatting - just your memory):**
 """.format(role=player.role.value))
     
     return "\n".join(parts)
