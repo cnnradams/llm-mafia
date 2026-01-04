@@ -52,18 +52,51 @@ class MafiaCLI:
         # Debug mode - print prompts sent to LLMs
         self.debug_mode: bool = False
     
-    async def _update_all_memories(self, phase_events: str) -> None:
-        """Update memory for all alive agents after a phase."""
+    async def _update_all_memories_end_of_day(self) -> None:
+        """Update memory for all alive agents at end of day.
+        
+        This is called once per day after judgment (before transitioning to night).
+        Agents receive the full day transcript (night results through judgment)
+        and must summarize it into their working memory.
+        """
         if not self.enable_memory or not self.game:
             return
         
-        console.print("[dim]Updating agent memories...[/dim]")
+        console.print("[dim]Updating agent memories (end of day)...[/dim]")
+        
+        day = self.game.day
         
         for player in self.game.get_alive_players():
             agent = self.agents.get(player.player_id)
             if agent:
                 try:
-                    await agent.update_memory(self.game, phase_events)
+                    # Show memory update prompt in debug mode
+                    if self.debug_mode:
+                        from llm.memory import build_memory_update_prompt, build_day_events_transcript
+                        
+                        current_memory = agent.memory.memory_text or ""
+                        day_events = build_day_events_transcript(self.game, day)
+                        
+                        memory_prompt = build_memory_update_prompt(
+                            game_state=self.game,
+                            player=player,
+                            day_events=day_events,
+                            current_memory=current_memory,
+                        )
+                        
+                        model_label = player.model_label or "?"
+                        title = f"🐛 DEBUG: {player.name} ({model_label}) - Memory Update (Day {day})"
+                        
+                        console.print("\n" + "="*80)
+                        console.print(Panel(
+                            Markdown(memory_prompt),
+                            title=title,
+                            border_style="magenta",
+                            expand=False
+                        ))
+                        console.print("="*80 + "\n")
+                    
+                    await agent.update_memory_end_of_day(self.game, day)
                 except Exception as e:
                     console.print(f"[dim]Memory update failed for {player.name}: {e}[/dim]")
     
@@ -112,47 +145,6 @@ class MafiaCLI:
         
         return action
     
-    def _get_phase_events_summary(self) -> str:
-        """Get a summary of events from the current phase."""
-        if not self.game:
-            return ""
-        
-        events = self.game.event_log.get_events_by_day(self.game.day)
-        current_phase = self.game.current_phase.value
-        
-        lines = []
-        for event in events:
-            if event.phase == current_phase:
-                if event.type == EventType.SPEAK:
-                    speaker = self.game.players.get(event.player_id)
-                    msg = event.data.get('message', '')[:150]
-                    if speaker:
-                        lines.append(f"{speaker.name}: \"{msg}\"")
-                elif event.type == EventType.NOMINATE:
-                    nominator = self.game.players.get(event.player_id)
-                    target = self.game.players.get(event.target_id)
-                    if nominator and target:
-                        lines.append(f"{nominator.name} nominated {target.name}")
-                elif event.type == EventType.ELIMINATE:
-                    eliminated = self.game.players.get(event.player_id)
-                    role = event.data.get('role', 'UNKNOWN')
-                    if eliminated:
-                        lines.append(f"{eliminated.name} was executed (was {role})")
-                elif event.type == EventType.KILL:
-                    killed = self.game.players.get(event.target_id)
-                    role = event.data.get('role', 'UNKNOWN')
-                    if killed:
-                        lines.append(f"{killed.name} was killed at night (was {role})")
-        
-        # Add nomination counts if in nomination phase
-        if self.game.current_phase == Phase.DAY_NOMINATION and self.game.nominations:
-            lines.append("\nNomination results:")
-            for target_id, nominators in sorted(self.game.nominations.items(), key=lambda x: -len(x[1])):
-                target = self.game.players.get(target_id)
-                if target:
-                    lines.append(f"  {target.name}: {len(nominators)} votes")
-        
-        return "\n".join(lines)
     
     def create_game(
         self,
@@ -216,7 +208,7 @@ class MafiaCLI:
         
         # Standard Mafia: Start at Night so Mafia kills first, giving Day 1 information
         self.game.current_phase = Phase.NIGHT
-        self.game.day = 0  # Night before Day 1
+        self.game.day = 1  # Night 1 → Day 1 → Night 2 → Day 2 → ...
     
     def display_state(self, show_roles: bool = True) -> None:
         """Display the current game state."""
@@ -505,11 +497,7 @@ class MafiaCLI:
             
             console.print()
         
-        # Update memories before moving to next phase
-        phase_events = self._get_phase_events_summary()
-        await self._update_all_memories(phase_events)
-        
-        # Move to nomination phase
+        # Move to nomination phase (memory update happens at end of day)
         console.print("[yellow]Discussion complete. Moving to nominations...[/yellow]")
         self.game.current_phase = Phase.DAY_NOMINATION
         self.game.reset_speaker_order()
@@ -672,11 +660,7 @@ class MafiaCLI:
             else:
                 console.print(f"[bold]{defendant.name} (defendant):[/bold] [dim](remains silent)[/dim]")
         
-        # Update memories with defense statements
-        phase_events = self._get_phase_events_summary()
-        await self._update_all_memories(phase_events)
-        
-        # Move to judgment
+        # Move to judgment (memory update happens at end of day)
         console.print("\n[yellow]Defense complete. Moving to judgment...[/yellow]")
         self.game.trial_state.defense_phase = "done"
         self.game.current_phase = Phase.DAY_JUDGMENT
@@ -775,21 +759,22 @@ class MafiaCLI:
             # INNOCENT or TIE - acquit
             console.print(f"\n[bold green]✓ {defendant.name} has been acquitted![/bold green]")
         
-        # Update memories with judgment results
-        phase_events = self._get_phase_events_summary()
-        await self._update_all_memories(phase_events)
+        # Update memories at end of day (full day transcript: night through judgment)
+        await self._update_all_memories_end_of_day()
         
         # Move to night
         self._transition_to_night()
     
     def _transition_to_night(self) -> None:
-        """Transition to night phase."""
+        """Transition to night phase (starts a new day cycle)."""
+        # Increment day when transitioning to night (Night N+1 starts a new cycle)
+        self.game.day += 1
         self.game.current_phase = Phase.NIGHT
         self.game.trial_state = None
         self.game.nominations = {}
         self.game.who_nominated = {}
         self.game.reset_speaker_order()
-        console.print("\n[bold]🌙 Night falls...[/bold]")
+        console.print(f"\n[bold]🌙 Night {self.game.day} falls...[/bold]")
     
     async def _run_night(self) -> None:
         """Handle night phase - Mafia kills, Doctor saves, Detective investigates."""
@@ -867,8 +852,7 @@ class MafiaCLI:
             alive_after = set(p.player_id for p in self.game.get_alive_players())
             died = alive_before - alive_after
             
-            # Dawn
-            self.game.day += 1
+            # Dawn - same day number (Night N → Day N)
             self.game.current_phase = Phase.DAY_DISCUSSION
             self.game.reset_speaker_order()
             self.game.nominations = {}
@@ -883,14 +867,7 @@ class MafiaCLI:
             else:
                 console.print(f"[green]Everyone survived the night![/green]")
             
-            # Update memories with night results
-            night_summary = "Night phase completed. "
-            if died:
-                dead_names = [self.game.players[pid].name for pid in died]
-                night_summary += f"Killed: {', '.join(dead_names)}. "
-            else:
-                night_summary += "No one died. "
-            await self._update_all_memories(night_summary)
+            # Memory update happens at end of day (night results are included in day transcript)
             
             # Check win condition
             winner = self.game.check_win_conditions()

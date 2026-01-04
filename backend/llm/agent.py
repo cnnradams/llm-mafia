@@ -9,7 +9,7 @@ from game.actions import (
 )
 from llm.openrouter_client import get_client
 from llm.prompts import build_prompt_for_player
-from llm.memory import PlayerMemory, MEMORY_UPDATE_PROMPT
+from llm.memory import PlayerMemory, build_memory_update_prompt, build_day_events_transcript
 from config import DEFAULT_MODEL
 
 
@@ -74,23 +74,32 @@ class LLMAgent:
             print(f"Error getting action from LLM: {e}, falling back to pass")
             return PassAction(player_id=self.player_id)
     
-    async def update_memory(
+    async def update_memory_end_of_day(
         self,
         game_state: GameState,
-        phase_events: str,
+        day: int,
     ) -> None:
-        """Update the agent's memory after a phase completes."""
+        """Update the agent's memory at end of day with full day transcript.
+        
+        This is called once at the end of each day (after judgment, before night)
+        with the complete transcript of events from night through judgment.
+        """
         client = get_client()
         
-        player = game_state.players[self.player_id]
-        current_memory = self.memory.memory_text or "No previous memory."
+        player = game_state.players.get(self.player_id)
+        if not player or not player.is_alive:
+            return  # Don't update memory for dead players
         
-        # Include player identity context in memory update
-        identity_context = f"You are {player.name} ({self.player_id}), Role: {player.role.value}, Team: {player.team.value}"
+        current_memory = self.memory.memory_text or ""
         
-        prompt = MEMORY_UPDATE_PROMPT.format(
-            identity=identity_context,
-            phase_events=phase_events,
+        # Build complete day events transcript
+        day_events = build_day_events_transcript(game_state, day)
+        
+        # Build comprehensive memory update prompt with full context
+        prompt = build_memory_update_prompt(
+            game_state=game_state,
+            player=player,
+            day_events=day_events,
             current_memory=current_memory,
         )
         
@@ -105,10 +114,14 @@ class LLMAgent:
             
             # Update memory from response
             if "memory" in response_data:
-                self.memory.update_memory(response_data["memory"])
+                new_memory = response_data["memory"]
+                # Sanitize: remove control characters that break JSON
+                new_memory = ''.join(char for char in new_memory if ord(char) >= 32 or char in '\n\t')
+                self.memory.update_memory(new_memory)
         
         except Exception as e:
             print(f"Error updating memory for {self.player_id}: {e}")
+            # On error, keep the previous memory (don't clear it)
     
     async def get_random_action(self, game_state: GameState) -> Action:
         """Get a random valid action (fallback)."""

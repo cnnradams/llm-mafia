@@ -68,10 +68,15 @@ def build_prompt_for_player(
     # Player list with IDs
     prompt_parts.append(build_player_list(game_state))
     
-    # Complete game history
+    # Complete game history (completed days only)
     history = build_complete_history(game_state)
     if history:
         prompt_parts.append(history)
+    
+    # Current day events (what's happened today so far)
+    today = build_today_events(game_state)
+    if today:
+        prompt_parts.append(today)
     
     # Current phase context and action format
     phase = game_state.current_phase
@@ -111,12 +116,18 @@ def build_game_setup(game_state: GameState) -> str:
 
 
 def build_complete_history(game_state: GameState) -> str:
-    """Build a complete history of all game events organized by day/phase."""
-    parts = ["\n## Complete Game History"]
+    """Build a complete history of COMPLETED days only (not current day in progress).
+    
+    The current day's events happen in real-time and agents see them as they occur.
+    Past days should be in the agent's memory (updated at end of each day).
+    """
+    parts = ["\n## Complete Game History (Completed Days)"]
     
     if not game_state.event_log.events:
         parts.append("\n(No events yet - game just started)")
         return "\n".join(parts)
+    
+    current_day = game_state.day
     
     # Organize events by day
     events_by_day: Dict[int, List[GameEvent]] = {}
@@ -125,8 +136,14 @@ def build_complete_history(game_state: GameState) -> str:
             events_by_day[event.day] = []
         events_by_day[event.day].append(event)
     
-    # Build history for each day
-    for day in sorted(events_by_day.keys()):
+    # Build history for COMPLETED days only (exclude current day in progress)
+    completed_days = [day for day in sorted(events_by_day.keys()) if day < current_day]
+    
+    if not completed_days:
+        parts.append("\n(No completed days yet - this is Day 1)")
+        return "\n".join(parts)
+    
+    for day in completed_days:
         day_events = events_by_day[day]
         
         # Night events
@@ -145,16 +162,31 @@ def build_complete_history(game_state: GameState) -> str:
             if not kills:
                 parts.append("- No one died this night")
         
-        # Day events - only show completed days (where nominations or judgment occurred)
+        # Day events - show discussion, nominations, trial, judgment
+        discussion_events = [e for e in day_events if e.phase == "DAY_DISCUSSION"]
         nomination_events = [e for e in day_events if e.phase == "DAY_NOMINATION"]
-        judgment_events = [e for e in day_events if e.phase in ["DAY_JUDGMENT", "DAY_DEFENSE"]]
+        defense_events = [e for e in day_events if e.phase == "DAY_DEFENSE"]
+        judgment_events = [e for e in day_events if e.phase == "DAY_JUDGMENT"]
         
+        discussion_speeches = [e for e in discussion_events if e.type == EventType.SPEAK]
         nominations = [e for e in nomination_events if e.type == EventType.NOMINATE]
+        defense_speeches = [e for e in defense_events if e.type == EventType.SPEAK]
         eliminations = [e for e in judgment_events if e.type == EventType.ELIMINATE]
         
-        # Only show Day section if nominations have occurred (not just discussion)
-        if nominations:
+        # Show Day section if there's discussion or nominations
+        if discussion_speeches or nominations:
             parts.append(f"\n### Day {day}")
+            
+            # Discussion phase - show all speeches
+            if discussion_speeches:
+                parts.append("\n**Discussion:**")
+                for i, speech in enumerate(discussion_speeches, 1):
+                    speaker = game_state.players.get(speech.player_id)
+                    if speaker:
+                        msg = speech.data.get('message', '')
+                        # Show full message for better context
+                        parts.append(f"{i}. **{speaker.name}**: \"{msg}\"")
+                        parts.append("")  # Blank line between speeches
             
             # Nominations - always show who was nominated
             # Group by target
@@ -181,6 +213,27 @@ def build_complete_history(game_state: GameState) -> str:
                 if defendant:
                     parts.append(f"\n**→ {defendant.name} went to trial**")
             
+            # Trial/Defense phase - show all defense speeches
+            if defense_speeches:
+                parts.append("\n**Trial Defense:**")
+                for speech in defense_speeches:
+                    speaker = game_state.players.get(speech.player_id)
+                    if speaker:
+                        context = speech.data.get('context', '')
+                        msg = speech.data.get('message', '')
+                        
+                        # Add context label
+                        if context == "opening_defense":
+                            label = f"**{speaker.name}** (DEFENDANT - opening)"
+                        elif context == "closing_defense":
+                            label = f"**{speaker.name}** (DEFENDANT - closing)"
+                        elif context == "town_response":
+                            label = f"**{speaker.name}**"
+                        else:
+                            label = f"**{speaker.name}**"
+                        
+                        parts.append(f"- {label}: \"{msg}\"")
+            
             # Trial/Judgment
             if eliminations:
                 for elim in eliminations:
@@ -202,6 +255,88 @@ def build_complete_history(game_state: GameState) -> str:
             elif judgment_events:
                 # Trial happened but no one was eliminated = acquittal
                 parts.append(f"**Trial Result:** {defendant.name} was **ACQUITTED**")
+    
+    return "\n".join(parts)
+
+
+def build_today_events(game_state: GameState) -> str:
+    """Build a summary of events that have happened TODAY (current day in progress)."""
+    parts = [f"\n## Today's Events (Day {game_state.day})"]
+    
+    current_day = game_state.day
+    events = game_state.event_log.get_events_by_day(current_day)
+    
+    if not events:
+        parts.append("\n(Day just started - no events yet)")
+        return "\n".join(parts)
+    
+    # Night events
+    night_events = [e for e in events if e.phase == "NIGHT"]
+    if night_events:
+        parts.append("\n**Night Results:**")
+        kills = [e for e in night_events if e.type == EventType.KILL]
+        for kill in kills:
+            victim = game_state.players.get(kill.target_id)
+            if victim:
+                role = kill.data.get("role", "UNKNOWN")
+                parts.append(f"- **{victim.name}** was killed by the Mafia (was {role})")
+        if not kills:
+            parts.append("- No one died this night")
+    
+    # Discussion events
+    discussion_events = [e for e in events if e.phase == "DAY_DISCUSSION"]
+    discussion_speeches = [e for e in discussion_events if e.type == EventType.SPEAK]
+    if discussion_speeches:
+        parts.append("\n**Discussion:**")
+        for i, speech in enumerate(discussion_speeches, 1):
+            speaker = game_state.players.get(speech.player_id)
+            if speaker:
+                msg = speech.data.get('message', '')
+                parts.append(f"{i}. **{speaker.name}**: \"{msg}\"")
+                parts.append("")  # Blank line
+    
+    # Nomination events (but don't show "went to trial" until nominations are complete)
+    nomination_events = [e for e in events if e.phase == "DAY_NOMINATION"]
+    nominations = [e for e in nomination_events if e.type == EventType.NOMINATE]
+    if nominations:
+        # Group by target
+        nom_by_target: Dict[str, List[str]] = {}
+        for nom in nominations:
+            target_id = nom.target_id
+            if target_id not in nom_by_target:
+                nom_by_target[target_id] = []
+            nominator = game_state.players.get(nom.player_id)
+            if nominator:
+                nom_by_target[target_id].append(nominator.name)
+        
+        parts.append("\n**Nominations so far:**")
+        for target_id, nominators in sorted(nom_by_target.items(), key=lambda x: -len(x[1])):
+            target = game_state.players.get(target_id)
+            if target:
+                nom_str = ", ".join(nominators)
+                parts.append(f"- {target.name}: {len(nominators)} votes ({nom_str})")
+    
+    # Defense/Trial events
+    defense_events = [e for e in events if e.phase == "DAY_DEFENSE"]
+    defense_speeches = [e for e in defense_events if e.type == EventType.SPEAK]
+    if defense_speeches:
+        parts.append("\n**Trial Defense:**")
+        for speech in defense_speeches:
+            speaker = game_state.players.get(speech.player_id)
+            if speaker:
+                context = speech.data.get('context', '')
+                msg = speech.data.get('message', '')
+                
+                if context == "opening_defense":
+                    label = f"**{speaker.name}** (DEFENDANT - opening)"
+                elif context == "closing_defense":
+                    label = f"**{speaker.name}** (DEFENDANT - closing)"
+                elif context == "town_response":
+                    label = f"**{speaker.name}**"
+                else:
+                    label = f"**{speaker.name}**"
+                
+                parts.append(f"- {label}: \"{msg}\"")
     
     return "\n".join(parts)
 
@@ -329,18 +464,7 @@ def build_discussion_prompt(game_state: GameState, player: Player) -> str:
     
     parts.append("\nThis is the discussion phase. Share your observations, suspicions, or defend yourself.")
     parts.append("Keep your message focused and strategic.")
-    
-    # Show recent speeches from THIS discussion phase only
-    speeches = game_state.event_log.get_speeches()
-    discussion_speeches = [s for s in speeches 
-                          if s.day == game_state.day and s.phase == "DAY_DISCUSSION"]
-    if discussion_speeches:
-        parts.append("\n**Recent discussion:**")
-        for speech in discussion_speeches[-5:]:
-            speaker = game_state.players.get(speech.player_id)
-            if speaker:
-                msg = speech.data.get('message', '')
-                parts.append(f"- {speaker.name}: \"{msg}\"")
+    parts.append("\n*Note: See 'Today's Events' above for night results and discussion so far.*")
     
     parts.append("\n**Respond with JSON:**")
     parts.append('```json')
@@ -356,19 +480,12 @@ def build_nomination_prompt(game_state: GameState, player: Player) -> str:
     
     parts.append("\nYou MUST nominate one player you find suspicious.")
     parts.append("The player with the most nominations goes to trial.")
+    parts.append("\n*Note: See 'Today's Events' above for discussion and nominations so far.*")
     
     alive_others = [p for p in game_state.get_alive_players() if p.player_id != player.player_id]
     parts.append("\n**Alive players to nominate:**")
     for p in alive_others:
         parts.append(f"- {p.name} (`{p.player_id}`)")
-    
-    # Show current nominations if any
-    if game_state.nominations:
-        parts.append("\n**Current nomination counts:**")
-        for target_id, nominators in sorted(game_state.nominations.items(), key=lambda x: -len(x[1])):
-            target = game_state.players.get(target_id)
-            if target:
-                parts.append(f"- {target.name}: {len(nominators)} nomination(s)")
     
     parts.append("\n**Respond with JSON:**")
     parts.append('```json')
@@ -393,20 +510,7 @@ def build_defense_prompt(game_state: GameState, player: Player) -> str:
     
     is_defendant = player.player_id == defendant.player_id
     
-    # Show trial speeches so far - FULL speeches
-    trial_speeches = [s for s in game_state.event_log.get_speeches() 
-                      if s.day == game_state.day and s.phase == "DAY_DEFENSE"]
-    if trial_speeches:
-        parts.append("\n**Trial statements so far:**")
-        for speech in trial_speeches:
-            speaker = game_state.players.get(speech.player_id)
-            if speaker:
-                context = speech.data.get('context', '')
-                msg = speech.data.get('message', '')
-                if context == "opening_defense":
-                    parts.append(f"\n- **{speaker.name} (opening):** \"{msg}\"")
-                elif context == "town_response":
-                    parts.append(f"\n- **{speaker.name}:** \"{msg}\"")
+    parts.append(f"\n*Note: See 'Today's Events' above for discussion and trial statements so far.*")
     
     if is_defendant:
         parts.append(f"\n**⚠️ YOU ({player.name}) ARE ON TRIAL! THE TOWN WANTS TO EXECUTE YOU!**")
@@ -454,22 +558,7 @@ def build_judgment_prompt(game_state: GameState, player: Player) -> str:
         parts.append('```')
         return "\n".join(parts)
     
-    # Show trial speeches for context - FULL speeches, not summarized
-    trial_speeches = [s for s in game_state.event_log.get_speeches() 
-                      if s.day == game_state.day and s.phase == "DAY_DEFENSE"]
-    if trial_speeches:
-        parts.append("\n**Trial defense (full statements):**")
-        for speech in trial_speeches:
-            speaker = game_state.players.get(speech.player_id)
-            if speaker:
-                context = speech.data.get('context', '')
-                msg = speech.data.get('message', '')
-                if context == "opening_defense":
-                    parts.append(f"\n- **{speaker.name} (defendant opening):** \"{msg}\"")
-                elif context == "closing_defense":
-                    parts.append(f"\n- **{speaker.name} (defendant closing):** \"{msg}\"")
-                else:
-                    parts.append(f"\n- **{speaker.name}:** \"{msg}\"")
+    parts.append(f"\n*Note: See 'Today's Events' above for all discussion, nominations, and trial defense statements.*")
     
     parts.append(f"\n**Should {defendant.name} be executed?**")
     parts.append("- Vote GUILTY if you believe they are Mafia")

@@ -152,7 +152,12 @@ def process_night_action(game_state: GameState, action: Action) -> tuple[bool, O
 
 
 def transition_to_night(game_state: GameState) -> None:
-    """Transition from day to night phase."""
+    """Transition from day to night phase (starts a new day cycle).
+    
+    Day cycle: Night N → Day N → Night N+1 → Day N+1 → ...
+    Increment happens when transitioning TO night.
+    """
+    game_state.day += 1  # New day cycle starts with each night
     game_state.current_phase = Phase.NIGHT
     
     game_state.event_log.add_event(
@@ -163,8 +168,11 @@ def transition_to_night(game_state: GameState) -> None:
 
 
 def transition_to_day(game_state: GameState) -> None:
-    """Transition from night to day phase."""
-    game_state.day += 1
+    """Transition from night to day phase (same day cycle).
+    
+    Day cycle: Night N → Day N (no increment, same day number)
+    """
+    # No day increment - Night N and Day N share the same day number
     game_state.current_phase = Phase.DAY_DISCUSSION
     game_state.reset_speaker_order()
     game_state.nominations = {}
